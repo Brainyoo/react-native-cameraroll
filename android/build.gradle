@@ -43,6 +43,10 @@ def getExtOrIntegerDefault(name) {
 
 apply plugin: 'com.android.library'
 
+def safeExtGet(prop, fallback) {
+    rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+}
+
 /**
  * Original code: https://github.com/facebook/react-native/blob/main/packages/react-native/ReactAndroid/build.gradle#L382
  *
