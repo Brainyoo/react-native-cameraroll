@@ -81,6 +81,15 @@ def findNodeModulePath(baseDir, packageName) {
 }
 
 def resolveReactNativeDirectory() {
+
+    def reactNativeLocation = safeExtGet("REACT_NATIVE_NODE_MODULES_DIR", null)
+    if (reactNativeLocation != null) {
+      def reactNative = file(reactNativeLocation)
+      if (reactNative.exists()) {
+        return reactNative
+      }
+    }
+
     def reactNative = file("${findNodeModulePath(rootProject.projectDir, "react-native")}")
     if (reactNative.exists()) {
         return reactNative
