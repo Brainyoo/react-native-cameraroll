@@ -2,7 +2,10 @@
 // we use Object type because methods on the native side use NSDictionary and ReadableMap
 // and we want to stay compatible with those
 import {TurboModuleRegistry, TurboModule} from 'react-native';
-import type { PhotoThumbnail } from './CameraRoll';
+import type {PhotoThumbnail} from './CameraRoll';
+import type {Double} from 'react-native/Libraries/Types/CodegenTypes';
+
+export type AlbumType = 'All' | 'Album' | 'SmartAlbum';
 
 export type AlbumSubType =
   | 'AlbumRegular'
@@ -15,8 +18,10 @@ export type AlbumSubType =
   | 'Unknown';
 
 type Album = {
+  id: string;
   title: string;
   count: number;
+  type: AlbumType;
   subtype?: AlbumSubType;
 };
 
@@ -30,11 +35,15 @@ type SubTypes =
   | 'VideoHighFrameRate'
   | 'VideoTimelapse';
 
+type SourceType = 'UserLibrary' | 'CloudShared';
+
 type PhotoIdentifier = {
   node: {
+    id: string;
     type: string;
     subTypes: SubTypes;
-    group_name: string;
+    sourceType: SourceType;
+    group_name: string[];
     image: {
       filename: string | null;
       filepath: string | null;
@@ -69,7 +78,7 @@ type PhotoIdentifiersPage = {
 };
 
 export interface Spec extends TurboModule {
-  saveToCameraRoll(uri: string, options: Object): Promise<string>;
+  saveToCameraRoll(uri: string, options: Object): Promise<PhotoIdentifier>;
   getPhotos(params: Object): Promise<PhotoIdentifiersPage>;
   getAlbums(params: Object): Promise<Album[]>;
   deletePhotos(photoUris: Array<string>): Promise<void>;
@@ -79,8 +88,10 @@ export interface Spec extends TurboModule {
   ): Promise<PhotoIdentifier>;
   getPhotoThumbnail(
     internalID: string,
-    options: Object
-  ): Promise<PhotoThumbnail>
+    options: Object,
+  ): Promise<PhotoThumbnail>;
+  addListener(eventName: string): void;
+  removeListeners(count: Double): void;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('RNCCameraRoll');

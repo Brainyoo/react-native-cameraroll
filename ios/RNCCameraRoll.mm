@@ -14,6 +14,8 @@
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <MobileCoreServices/UTType.h>
+#import <MobileCoreServices/MobileCoreServices.h>
+#import <ImageIO/ImageIO.h>
 
 #import <React/RCTBridge.h>
 #import <React/RCTConvert.h>
@@ -90,6 +92,9 @@ RCT_ENUM_CONVERTER(PHAssetCollectionSubtype, (@{
 @end
 
 @implementation RNCCameraRoll
+{
+  bool hasListeners;
+}
 
 RCT_EXPORT_MODULE()
 
@@ -174,24 +179,27 @@ RCT_EXPORT_METHOD(saveToCameraRoll:(NSURLRequest *)request
         [request addResourceWithType:PHAssetResourceTypePhoto data:data options:NULL];
         assetRequest = request;
       } else {
-        NSData *data = [NSData dataWithContentsOfURL:inputURI];
         if ([[inputURI.pathExtension lowercaseString] isEqualToString:@"webp"]) {
+          NSData *data = [NSData dataWithContentsOfURL:inputURI];
           UIImage *webpImage;
 
-          #ifdef SD_WEB_IMAGE_WEBP_CODER_AVAILABLE 
+          #ifdef SD_WEB_IMAGE_WEBP_CODER_AVAILABLE
             webpImage = [[SDImageWebPCoder sharedCoder] decodedImageWithData:data options:nil];
           #else
             if (@available(iOS 14, *)) {
               webpImage = [UIImage imageWithData:data];
+            } else {
+              // webp cannot be saved if SDWebImage is not installed and we're not on iOS 14 or above.
+              reject(kErrorUnableToSave, nil, nil);
+              return;
             }
           #endif
-          
-          if (webpImage) {
-            data = UIImageJPEGRepresentation(webpImage, 1.0);
-          }
+
+          assetRequest = [PHAssetChangeRequest creationRequestForAssetFromImage:webpImage];
+        } else {
+          // normal Image (jpg, heif, png, ...)
+          assetRequest = [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:inputURI];
         }
-        UIImage *image = [UIImage imageWithData:data];
-        assetRequest = [PHAssetChangeRequest creationRequestForAssetFromImage:image];
       }
       placeholder = [assetRequest placeholderForCreatedAsset];
       if (![options[@"album"] isEqualToString:@""]) {
@@ -201,8 +209,26 @@ RCT_EXPORT_METHOD(saveToCameraRoll:(NSURLRequest *)request
       }
     } completionHandler:^(BOOL success, NSError *error) {
       if (success) {
-        NSString *uri = [NSString stringWithFormat:@"ph://%@", [placeholder localIdentifier]];
-        resolve(uri);
+        PHFetchOptions *options = [PHFetchOptions new];
+        options.includeHiddenAssets = YES;
+        options.includeAllBurstAssets = YES;
+        options.fetchLimit = 1;
+        PHFetchResult<PHAsset *> *createdAsset = [PHAsset fetchAssetsWithLocalIdentifiers:@[placeholder.localIdentifier]
+                                                                                  options:options];
+        if (createdAsset.count < 1) {
+          reject(kErrorUnableToSave, nil, nil);
+          return;
+        }
+        NSDictionary *dictionary = [self convertAssetToDictionary:[createdAsset firstObject]
+                                                    includeAlbums:YES
+                                                  includeFilename:YES
+                                             includeFileExtension:YES
+                                                 includeImageSize:YES
+                                                  includeFileSize:YES
+                                          includePlayableDuration:YES
+                                                  includeLocation:YES
+                                                  includeSourceType:YES];
+        resolve(dictionary);
       } else {
         reject(kErrorUnableToSave, nil, error);
       }
@@ -252,24 +278,37 @@ RCT_EXPORT_METHOD(getAlbums:(NSDictionary *)params
                   reject:(RCTPromiseRejectBlock)reject)
 {
   NSString *const mediaType = [params objectForKey:@"assetType"] ? [RCTConvert NSString:params[@"assetType"]] : @"All";
-    NSLog(@"type: %@", mediaType);
-  PHFetchOptions* options = [[PHFetchOptions alloc] init];
-    NSLog(@"Options: %@", options);
-  PHFetchResult<PHAssetCollection *> *const assetCollectionFetchResult = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum subtype:PHAssetCollectionSubtypeAny options:options];
+  NSString *const albumType = [params objectForKey:@"albumType"] ? [RCTConvert NSString:params[@"albumType"]] : @"Album";
+
   NSMutableArray * result = [NSMutableArray new];
-  [assetCollectionFetchResult enumerateObjectsUsingBlock:^(PHAssetCollection * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
-    PHFetchOptions *const assetFetchOptions = [RCTConvert PHFetchOptionsFromMediaType:mediaType fromTime:0 toTime:0];
-    // Enumerate assets within the collection
-    PHFetchResult<PHAsset *> *const assetsFetchResult = [PHAsset fetchAssetsInAssetCollection:obj options:assetFetchOptions];
-    if (assetsFetchResult.count > 0) {
-      NSString *subtypeString = subTypeLabelForCollection(obj);
-      [result addObject:@{
-        @"title": [obj localizedTitle],
-        @"count": @(assetsFetchResult.count),
-        @"subtype": subtypeString
-      }];
-    }
-  }];
+  NSString *__block fetchedAlbumType = nil;
+  void (^convertAsset)(PHAssetCollection * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) =
+    ^(PHAssetCollection * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+      PHFetchOptions *const assetFetchOptions = [RCTConvert PHFetchOptionsFromMediaType:mediaType fromTime:0 toTime:0];
+      // Enumerate assets within the collection
+      PHFetchResult<PHAsset *> *const assetsFetchResult = [PHAsset fetchAssetsInAssetCollection:obj options:assetFetchOptions];
+      if (assetsFetchResult.count > 0) {
+        [result addObject:@{
+          @"title": [obj localizedTitle],
+          @"count": @(assetsFetchResult.count),
+          @"type": fetchedAlbumType,
+          @"id": [obj localIdentifier]
+        }];
+      }
+    };
+
+  PHFetchOptions* options = [[PHFetchOptions alloc] init];
+  if ([albumType isEqualToString:@"SmartAlbum"] || [albumType isEqualToString:@"All"]) {
+    fetchedAlbumType = @"SmartAlbum";
+    PHFetchResult<PHAssetCollection *> *const assets = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeSmartAlbum subtype:PHAssetCollectionSubtypeAny options:options];
+    [assets enumerateObjectsUsingBlock:convertAsset];
+  }
+  if ([albumType isEqualToString:@"Album"] || [albumType isEqualToString:@"All"]) {
+    fetchedAlbumType = @"Album";
+    PHFetchResult<PHAssetCollection *> *const assets = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum subtype:PHAssetCollectionSubtypeAny options:options];
+    [assets enumerateObjectsUsingBlock:convertAsset];
+  }
+
   resolve(result);
 }
 
@@ -299,6 +338,92 @@ static void RCTResolvePromise(RCTPromiseResolveBlock resolve,
   });
 }
 
+- (NSDictionary*) convertAssetToDictionary:(PHAsset*)asset
+                             includeAlbums:(BOOL)includeAlbums
+                           includeFilename:(BOOL)includeFilename
+                      includeFileExtension:(BOOL)includeFileExtension
+                          includeImageSize:(BOOL)includeImageSize
+                           includeFileSize:(BOOL)includeFileSize
+                   includePlayableDuration:(BOOL)includePlayableDuration
+                           includeLocation:(BOOL)includeLocation
+                           includeSourceType:(BOOL)includeSourceType
+{
+  NSString *const uri = [NSString stringWithFormat:@"ph://%@", [asset localIdentifier]];
+
+  NSString *_Nullable originalFilename = NULL;
+  NSString *_Nullable fileExtension = NULL;
+  PHAssetResource *_Nullable resource = NULL;
+  NSNumber* fileSize = [NSNumber numberWithInt:0];
+
+  if (includeFilename || includeFileSize) {
+    NSArray<PHAssetResource *> *const assetResources = [PHAssetResource assetResourcesForAsset:asset];
+    resource = [assetResources firstObject];
+    originalFilename = resource.originalFilename;
+    fileSize = [resource valueForKey:@"fileSize"];
+  }
+
+  NSString *const assetMediaTypeLabel = (asset.mediaType == PHAssetMediaTypeVideo
+                                        ? @"video"
+                                        : (asset.mediaType == PHAssetMediaTypeImage
+                                            ? @"image"
+                                            : (asset.mediaType == PHAssetMediaTypeAudio
+                                              ? @"audio"
+                                              : @"unknown")));
+
+  NSArray<NSString*> *const assetMediaSubtypesLabel = [self mediaSubTypeLabelsForAsset:asset];
+
+  NSArray<NSString*> *albums = @[];
+
+  if (includeAlbums) {
+    albums = [self getAlbumsForAsset:asset];
+  }
+
+  NSString *_Nullable sourceType = NULL;
+
+  if (includeSourceType) {
+    sourceType = [self sourceTypeForAsset:asset];
+  }
+
+  if (includeFileExtension) {
+    NSString *name = [asset valueForKey:@"filename"];
+    NSString *extension = [name pathExtension];
+    fileExtension = [extension lowercaseString];
+  }
+
+  CLLocation *const loc = asset.location;
+  NSString *localIdentifier = asset.localIdentifier;
+
+  return @{
+    @"node": @{
+      @"id": localIdentifier,
+      @"type": assetMediaTypeLabel, // TODO: switch to mimeType?
+      @"subTypes": assetMediaSubtypesLabel,
+      @"sourceType": (includeSourceType ? sourceType : [NSNull null]),
+      @"group_name": albums,
+      @"image": @{
+          @"uri": uri,
+          @"extension": (includeFileExtension ? fileExtension : [NSNull null]),
+          @"filename": (includeFilename && originalFilename ? originalFilename : [NSNull null]),
+          @"height": (includeImageSize ? @([asset pixelHeight]) : [NSNull null]),
+          @"width": (includeImageSize ? @([asset pixelWidth]) : [NSNull null]),
+          @"fileSize": (includeFileSize && fileSize ? fileSize : [NSNull null]),
+          @"playableDuration": (includePlayableDuration && asset.mediaType != PHAssetMediaTypeImage
+                                ? @([asset duration]) // fractional seconds
+                                : [NSNull null])
+      },
+      @"timestamp": @(asset.creationDate.timeIntervalSince1970),
+      @"modificationTimestamp": @(asset.modificationDate.timeIntervalSince1970),
+      @"location": (includeLocation && loc ? @{
+          @"latitude": @(loc.coordinate.latitude),
+          @"longitude": @(loc.coordinate.longitude),
+          @"altitude": @(loc.altitude),
+          @"heading": @(loc.course),
+          @"speed": @(loc.speed), // speed in m/s
+        } : [NSNull null])
+      }
+  };
+}
+
 RCT_EXPORT_METHOD(getPhotos:(NSDictionary *)params
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject)
@@ -320,16 +445,11 @@ RCT_EXPORT_METHOD(getPhotos:(NSDictionary *)params
   BOOL __block includeFilename = [include indexOfObject:@"filename"] != NSNotFound;
   BOOL __block includeFileSize = [include indexOfObject:@"fileSize"] != NSNotFound;
   BOOL __block includeFileExtension = [include indexOfObject:@"fileExtension"] != NSNotFound;
+  BOOL __block includeSourceType = [include indexOfObject:@"sourceType"] != NSNotFound;
   BOOL __block includeLocation = [include indexOfObject:@"location"] != NSNotFound;
   BOOL __block includeImageSize = [include indexOfObject:@"imageSize"] != NSNotFound;
   BOOL __block includePlayableDuration = [include indexOfObject:@"playableDuration"] != NSNotFound;
-
-  // If groupTypes is "all", we want to fetch the SmartAlbum "all photos". Otherwise, all
-  // other groupTypes values require the "album" collection type.
-  PHAssetCollectionType const collectionType = ([groupTypes isEqualToString:@"all"]
-                                                ? PHAssetCollectionTypeSmartAlbum
-                                                : PHAssetCollectionTypeAlbum);
-  PHAssetCollectionSubtype const collectionSubtype = [RCTConvert PHAssetCollectionSubtype:groupTypes];
+  BOOL __block includeAlbums = [include indexOfObject:@"albums"] != NSNotFound;
 
   // Predicate for fetching assets within a collection
   PHFetchOptions *const assetFetchOptions = [RCTConvert PHFetchOptionsFromMediaType:mediaType fromTime:fromTime toTime:toTime];
@@ -356,15 +476,7 @@ RCT_EXPORT_METHOD(getPhotos:(NSDictionary *)params
   BOOL __block resolvedPromise = NO;
   NSMutableArray<NSDictionary<NSString *, id> *> *assets = [NSMutableArray new];
 
-  // Filter collection name ("group")
-  PHFetchOptions *const collectionFetchOptions = [PHFetchOptions new];
-  collectionFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"endDate" ascending:NO]];
-  if (groupName != nil) {
-    collectionFetchOptions.predicate = [NSPredicate predicateWithFormat:@"localizedTitle = %@", groupName];
-  }
-
   BOOL __block stopCollections_;
-  NSString __block *currentCollectionName;
 
   requestPhotoLibraryAccess(reject, ^(bool isLimited){
     void (^collectAsset)(PHAsset*, NSUInteger, BOOL*) = ^(PHAsset * _Nonnull asset, NSUInteger assetIdx, BOOL * _Nonnull stopAssets) {
@@ -376,18 +488,13 @@ RCT_EXPORT_METHOD(getPhotos:(NSDictionary *)params
         }
         return;
       }
-      NSString *_Nullable originalFilename = NULL;
-      NSString *_Nullable fileExtension = NULL;
       PHAssetResource *_Nullable resource = NULL;
-      NSNumber* fileSize = [NSNumber numberWithInt:0];
 
-      if (includeFilename || includeFileSize || [mimeTypes count] > 0) {
+      if ([mimeTypes count] > 0) {
         // Get underlying resources of an asset - this includes files as well as details about edited PHAssets
-        // This is required for the filename and mimeType filtering
+        // This is required for mimeType filtering
         NSArray<PHAssetResource *> *const assetResources = [PHAssetResource assetResourcesForAsset:asset];
         resource = [assetResources firstObject];
-        originalFilename = resource.originalFilename;
-        fileSize = [resource valueForKey:@"fileSize"];
       }
 
       // WARNING: If you add any code to `collectAsset` that may skip adding an
@@ -424,66 +531,49 @@ RCT_EXPORT_METHOD(getPhotos:(NSDictionary *)params
         return;
       }
 
-      NSString *const assetMediaTypeLabel = (asset.mediaType == PHAssetMediaTypeVideo
-                                            ? @"video"
-                                            : (asset.mediaType == PHAssetMediaTypeImage
-                                                ? @"image"
-                                                : (asset.mediaType == PHAssetMediaTypeAudio
-                                                  ? @"audio"
-                                                  : @"unknown")));
-
-      NSArray<NSString*> *const assetMediaSubtypesLabel = [self mediaSubTypeLabelsForAsset:asset];
-
-      if (includeFileExtension) {
-        NSString *name = [asset valueForKey:@"filename"];
-        NSString *extension = [name pathExtension];
-        fileExtension = [extension lowercaseString];
-      }
-
-      CLLocation *const loc = asset.location;
-
-      [assets addObject:@{
-        @"node": @{
-          @"type": assetMediaTypeLabel, // TODO: switch to mimeType?
-          @"subTypes":assetMediaSubtypesLabel,
-          @"group_name": currentCollectionName,
-          @"image": @{
-              @"uri": uri,
-              @"extension": (includeFileExtension ? fileExtension : [NSNull null]),
-              @"filename": (includeFilename && originalFilename ? originalFilename : [NSNull null]),
-              @"height": (includeImageSize ? @([asset pixelHeight]) : [NSNull null]),
-              @"width": (includeImageSize ? @([asset pixelWidth]) : [NSNull null]),
-              @"fileSize": (includeFileSize && fileSize ? fileSize : [NSNull null]),
-              @"playableDuration": (includePlayableDuration && asset.mediaType != PHAssetMediaTypeImage
-                                    ? @([asset duration]) // fractional seconds
-                                    : [NSNull null])
-          },
-          @"timestamp": @(asset.creationDate.timeIntervalSince1970),
-          @"modificationTimestamp": @(asset.modificationDate.timeIntervalSince1970),
-          @"location": (includeLocation && loc ? @{
-              @"latitude": @(loc.coordinate.latitude),
-              @"longitude": @(loc.coordinate.longitude),
-              @"altitude": @(loc.altitude),
-              @"heading": @(loc.course),
-              @"speed": @(loc.speed), // speed in m/s
-            } : [NSNull null])
-          }
-      }];
+      NSDictionary* dict = [self convertAssetToDictionary:asset
+                                            includeAlbums:includeAlbums
+                                          includeFilename:includeFilename
+                                     includeFileExtension:includeFileExtension
+                                         includeImageSize:includeImageSize
+                                          includeFileSize:includeFileSize
+                                  includePlayableDuration:includePlayableDuration
+                                          includeLocation:includeLocation
+                                          includeSourceType:includeSourceType];
+      [assets addObject:dict];
     };
 
     if ([groupTypes isEqualToString:@"all"]) {
       PHFetchResult <PHAsset *> *const assetFetchResult = [PHAsset fetchAssetsWithOptions: assetFetchOptions];
-      currentCollectionName = @"All Photos";
       [assetFetchResult enumerateObjectsUsingBlock:collectAsset];
     } else {
-      PHFetchResult<PHAssetCollection *> *const assetCollectionFetchResult = [PHAssetCollection fetchAssetCollectionsWithType:collectionType subtype:collectionSubtype options:collectionFetchOptions];
-      [assetCollectionFetchResult enumerateObjectsUsingBlock:^(PHAssetCollection * _Nonnull assetCollection, NSUInteger collectionIdx, BOOL * _Nonnull stopCollections) {
-        // Enumerate assets within the collection
-        PHFetchResult<PHAsset *> *const assetsFetchResult = [PHAsset fetchAssetsInAssetCollection:assetCollection options:assetFetchOptions];
-        currentCollectionName = [assetCollection localizedTitle];
-        [assetsFetchResult enumerateObjectsUsingBlock:collectAsset];
-        *stopCollections = stopCollections_;
-      }];
+      PHFetchResult<PHAssetCollection *> * assetCollectionFetchResult;
+      if ([groupTypes isEqualToString:@"smartalbum"]) {
+        assetCollectionFetchResult = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeSmartAlbum subtype:PHAssetCollectionSubtypeAny options:nil];
+        [assetCollectionFetchResult enumerateObjectsUsingBlock:^(PHAssetCollection * _Nonnull assetCollection, NSUInteger collectionIdx, BOOL * _Nonnull stopCollections) {
+          if ([assetCollection.localizedTitle isEqualToString:groupName]) {
+            PHFetchResult<PHAsset *> *const assetsFetchResult = [PHAsset fetchAssetsInAssetCollection:assetCollection options:assetFetchOptions];
+            [assetsFetchResult enumerateObjectsUsingBlock:collectAsset];
+            *stopCollections = stopCollections_;
+          }
+        }];
+      } else {
+        PHAssetCollectionSubtype const collectionSubtype = [RCTConvert PHAssetCollectionSubtype:groupTypes];
+
+        // Filter collection name ("group")
+        PHFetchOptions *const collectionFetchOptions = [PHFetchOptions new];
+        collectionFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"endDate" ascending:NO]];
+        if (groupName != nil) {
+          collectionFetchOptions.predicate = [NSPredicate predicateWithFormat:@"localizedTitle = %@", groupName];
+        }
+        assetCollectionFetchResult = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum subtype:collectionSubtype options:collectionFetchOptions];
+        [assetCollectionFetchResult enumerateObjectsUsingBlock:^(PHAssetCollection * _Nonnull assetCollection, NSUInteger collectionIdx, BOOL * _Nonnull stopCollections) {
+            // Enumerate assets within the collection
+          PHFetchResult<PHAsset *> *const assetsFetchResult = [PHAsset fetchAssetsInAssetCollection:assetCollection options:assetFetchOptions];
+          [assetsFetchResult enumerateObjectsUsingBlock:collectAsset];
+          *stopCollections = stopCollections_;
+        }];
+      }
     }
 
     // If we get this far and haven't resolved the promise yet, we reached the end of the list of photos
@@ -520,6 +610,29 @@ RCT_EXPORT_METHOD(deletePhotos:(NSArray<NSString *>*)assets
   }
   ];
 }
+
+- (NSArray<NSString *> *)supportedEvents {
+	return @[@"onProgressUpdate"];
+}
+
+-(void)startObserving {
+  hasListeners = YES;
+}
+
+-(void)stopObserving {
+  hasListeners = NO;
+}
+
+// Sends progress update for id when selected
+// media is downloading from iCloud
+-(void)sendProgressUpdateWithId:(NSString *)internalId
+					   progress:(double)progress {
+	if (hasListeners && self.callableJSModules) {
+		[self sendEventWithName:@"onProgressUpdate"
+						   body:@{@"id" : internalId, @"progress": @(progress)}];
+	}
+}
+
 
 RCT_EXPORT_METHOD(getPhotoByInternalID:(NSString *)internalId
                   options:(NSDictionary *)options
@@ -582,24 +695,23 @@ RCT_EXPORT_METHOD(getPhotoByInternalID:(NSString *)internalId
         requestOptions.networkAccessAllowed = YES;
         requestOptions.version = PHImageRequestOptionsVersionUnadjusted;
         requestOptions.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
+		requestOptions.progressHandler = ^(double progress, NSError * _Nullable error, BOOL * _Nonnull stop, NSDictionary * _Nullable info) {
+			[self sendProgressUpdateWithId:internalId progress:progress];
+		};
 
-        CGSize const targetSize = CGSizeMake((CGFloat)asset.pixelWidth, (CGFloat)asset.pixelHeight);
-        [[PHImageManager defaultManager] requestImageForAsset:asset
-                                                     targetSize:targetSize
-                                                    contentMode:PHImageContentModeDefault
+        [[PHImageManager defaultManager] requestImageDataAndOrientationForAsset:asset
                                                         options:requestOptions
-                                                  resultHandler:^(UIImage * _Nullable image,
-                                                                  NSDictionary * _Nullable info) {
+                                                  resultHandler:^(NSData *imageData, NSString *dataUTI, CGImagePropertyOrientation orientation, NSDictionary *info) {
           NSError *const error = [info objectForKey:PHImageErrorKey];
           if (error) {
             reject(@"Error while converting to JPEG image",@"Error while converting",error);
           }
 
           originalFilename = [originalFilename stringByReplacingOccurrencesOfString:@"HEIC" withString:@"JPEG" options:NSCaseInsensitiveSearch range:NSMakeRange(0, [originalFilename length])];
-          NSData *const imageData = UIImageJPEGRepresentation(image, quality);
+          NSData *const jpegData = [self convertHeicToJpeg:imageData quality:quality];
           NSFileManager *fileManager = [NSFileManager defaultManager];
           NSString *fullPath = [NSTemporaryDirectory() stringByAppendingPathComponent:originalFilename];
-          if ([fileManager createFileAtPath:fullPath contents:imageData attributes:nil]) {
+          if ([fileManager createFileAtPath:fullPath contents:jpegData attributes:nil]) {
             unsigned long long fileSize = [[fileManager attributesOfItemAtPath:fullPath error:nil] fileSize];
 
             resolve(@{
@@ -638,6 +750,9 @@ RCT_EXPORT_METHOD(getPhotoByInternalID:(NSString *)internalId
         PHContentEditingInputRequestOptions *const editOptions = [PHContentEditingInputRequestOptions new];
         // Download asset if on icloud.
         editOptions.networkAccessAllowed = YES;
+		editOptions.progressHandler = ^(double progress, BOOL * _Nonnull stop) {
+			[self sendProgressUpdateWithId:internalId progress:progress];
+		};
 
         [asset requestContentEditingInputWithOptions:editOptions completionHandler:^(PHContentEditingInput *contentEditingInput, NSDictionary *info) {
           if (contentEditingInput.mediaType == PHAssetMediaTypeImage) {
@@ -702,15 +817,15 @@ RCT_EXPORT_METHOD(getPhotoThumbnail:(NSString *)internalId
     checkPhotoLibraryConfig();
 
     BOOL const allowNetworkAccess = options[@"allowNetworkAccess"] == nil ? NO : [RCTConvert BOOL:options[@"allowNetworkAccess"]];
-    
+
     NSDictionary *const targetSize = [RCTConvert NSDictionary:options[@"targetSize"]];
     CGFloat const targetHeight = targetSize[@"height"] == nil ? 400 : [RCTConvert CGFloat:targetSize[@"height"]];
     CGFloat const targetWidth = targetSize[@"width"] == nil ? 400 : [RCTConvert CGFloat:targetSize[@"width"]];
-    
+
     CGFloat quality = options[@"quality"] == nil ? 1.0 : [RCTConvert CGFloat:options[@"quality"]];
 
     requestPhotoLibraryAccess(reject, ^(bool isLimited){
-    
+
         PHFetchResult<PHAsset *> *fetchResult;
         PHAsset *asset;
         NSString *mediaIdentifier = internalId;
@@ -730,7 +845,7 @@ RCT_EXPORT_METHOD(getPhotoThumbnail:(NSString *)internalId
             requestOptions.networkAccessAllowed = allowNetworkAccess;
             requestOptions.version = PHImageRequestOptionsVersionUnadjusted;
             requestOptions.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
-            
+
             CGSize const thumbnailSize = CGSizeMake(targetWidth, targetHeight);
             [[PHImageManager defaultManager] requestImageForAsset:asset
                                                        targetSize:thumbnailSize
@@ -742,9 +857,19 @@ RCT_EXPORT_METHOD(getPhotoThumbnail:(NSString *)internalId
                 if (error) {
                     reject(@"Error while getting thumbnail image",@"Error while getting thumbnail image",error);
                 }
-                
+
+                 if (!image) {
+                    reject(@"Error while getting thumbnail image", @"Image is nil", RCTErrorWithMessage(@"Image is nil"));
+                    return;
+                 }
+
                 NSString *thumbnailBase64 = [UIImageJPEGRepresentation(image, quality) base64EncodedStringWithOptions:NSDataBase64EncodingEndLineWithLineFeed];
                 
+                if (!thumbnailBase64) {
+                    reject(@"Error while encoding image to Base64", @"Failed to encode image to Base64", RCTErrorWithMessage(@"Failed to encode image to Base64"));
+                    return;
+                }
+
                 resolve(@{
                     @"thumbnailBase64": thumbnailBase64
                 });
@@ -760,7 +885,7 @@ RCT_EXPORT_METHOD(getPhotoThumbnail:(NSString *)internalId
 
 NSString *subTypeLabelForCollection(PHAssetCollection *assetCollection) {
     PHAssetCollectionSubtype subtype = assetCollection.assetCollectionSubtype;
-  
+
     switch (subtype) {
         case PHAssetCollectionSubtypeAlbumRegular:
             return @"AlbumRegular";
@@ -775,7 +900,7 @@ NSString *subTypeLabelForCollection(PHAssetCollection *assetCollection) {
       case PHAssetCollectionSubtypeAlbumMyPhotoStream:
           return @"AlbumMyPhotoStream";
       case PHAssetCollectionSubtypeAlbumCloudShared:
-          return @"AlbumCloudShared";      
+          return @"AlbumCloudShared";
       default:
           return @"Unknown";
   }
@@ -784,7 +909,7 @@ NSString *subTypeLabelForCollection(PHAssetCollection *assetCollection) {
 - (NSArray<NSString *> *) mediaSubTypeLabelsForAsset:(PHAsset *)asset {
     PHAssetMediaSubtype subtype = asset.mediaSubtypes;
     NSMutableArray<NSString*> *mediaSubTypeLabels = [NSMutableArray array];
-    
+
     if (subtype & PHAssetMediaSubtypePhotoPanorama) {
         [mediaSubTypeLabels addObject:@"PhotoPanorama"];
     }
@@ -811,6 +936,62 @@ NSString *subTypeLabelForCollection(PHAssetCollection *assetCollection) {
     }
 
     return mediaSubTypeLabels;
+}
+
+
+- (nullable NSString *) sourceTypeForAsset:(PHAsset *)asset {
+    PHAssetSourceType sourceType = asset.sourceType;
+
+    switch (sourceType) {
+      case PHAssetSourceTypeUserLibrary:
+          return @"UserLibrary";
+      case PHAssetSourceTypeCloudShared:
+          return @"CloudShared";
+      default:
+          return NULL;
+    }
+}
+
+- (NSData *)convertHeicToJpeg:(NSData *)heicData quality:(CGFloat)quality {
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)heicData, NULL);
+    if (!source) {
+        return nil;
+    }
+
+    NSDictionary *properties = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, 0, NULL);
+
+    NSMutableData *jpegData = [NSMutableData data];
+    CGImageDestinationRef destination = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)jpegData, kUTTypeJPEG, 1, NULL);
+    if (!destination) {
+        CFRelease(source);
+        return nil;
+    }
+
+    NSDictionary *options = @{(__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(quality)};
+    CGImageDestinationAddImageFromSource(destination, source, 0, (__bridge CFDictionaryRef)options);
+
+    if (!CGImageDestinationFinalize(destination)) {
+        CFRelease(destination);
+        CFRelease(source);
+        return nil;
+    }
+
+    CFRelease(destination);
+    CFRelease(source);
+
+    return jpegData;
+}
+
+- (NSArray<NSString *> *) getAlbumsForAsset:(PHAsset *)asset {
+    NSMutableArray<NSString *> *albumTitles = [NSMutableArray array];
+
+    PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsContainingAsset:asset withType:PHAssetCollectionTypeAlbum options:nil];
+
+    for (PHAssetCollection *collection in collections) {
+        [albumTitles addObject:collection.localizedTitle];
+    }
+
+    return [albumTitles copy];
 }
 
 static void checkPhotoLibraryConfig()

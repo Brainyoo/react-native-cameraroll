@@ -85,6 +85,8 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
   private static final String INCLUDE_IMAGE_SIZE = "imageSize";
   private static final String INCLUDE_PLAYABLE_DURATION = "playableDuration";
   private static final String INCLUDE_ORIENTATION = "orientation";
+  private static final String INCLUDE_ALBUMS = "albums";
+  private static final String INCLUDE_SOURCE_TYPE = "sourceType";
 
   private static final String[] PROJECTION = {
           Images.Media._ID,
@@ -176,7 +178,9 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
           mediaDetails.clear();
           mediaDetails.put(Images.Media.IS_PENDING, 0);
           resolver.update(mediaContentUri, mediaDetails, null, null);
-          mPromise.resolve(mediaContentUri.toString());
+
+          WritableMap asset = getSingleAssetInfo(mediaContentUri);
+          mPromise.resolve(asset);
         } else {
           final File environment;
           // Media is not saved into an album when using Environment.DIRECTORY_DCIM.
@@ -226,13 +230,19 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
           input.close();
           output.close();
 
+
           MediaScannerConnection.scanFile(
                   mContext,
                   new String[]{dest.getAbsolutePath()},
                   null,
                   (path, uri) -> {
                     if (uri != null) {
-                      mPromise.resolve(uri.toString());
+                      try {
+                        WritableMap asset = getSingleAssetInfo(uri);
+                        mPromise.resolve(asset);
+                      } catch (Exception exc) {
+                        mPromise.reject(ERROR_UNABLE_TO_SAVE, exc.getMessage());
+                      }
                     } else {
                       mPromise.reject(ERROR_UNABLE_TO_SAVE, "Could not add image to gallery");
                     }
@@ -256,6 +266,34 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
           }
         }
       }
+    }
+
+    private WritableMap getSingleAssetInfo(Uri assetUri) {
+      ContentResolver resolver = mContext.getContentResolver();
+
+      Cursor cursor = resolver.query(
+              assetUri,
+              PROJECTION,
+              null,
+              null,
+              null);
+      if (cursor == null) {
+        throw new RuntimeException("Failed to find the photo that was just saved!");
+      }
+      cursor.moveToFirst();
+      WritableMap asset = convertMediaToMap(resolver,
+              cursor,
+              Set.of(INCLUDE_LOCATION,
+                      INCLUDE_FILENAME,
+                      INCLUDE_FILE_SIZE,
+                      INCLUDE_FILE_EXTENSION,
+                      INCLUDE_IMAGE_SIZE,
+                      INCLUDE_PLAYABLE_DURATION,
+                      INCLUDE_ORIENTATION,
+                      INCLUDE_ALBUMS,
+                      INCLUDE_SOURCE_TYPE));
+      cursor.close();
+      return asset;
     }
   }
 
@@ -496,7 +534,7 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
       return;
     }
 
-    final String[] projection = {MediaStore.Images.ImageColumns.BUCKET_DISPLAY_NAME};
+    final String[] projection = {MediaStore.Images.ImageColumns.BUCKET_DISPLAY_NAME, MediaStore.Images.Media.BUCKET_ID};
 
     try {
       Cursor media = getReactApplicationContext().getContentResolver().query(
@@ -511,27 +549,35 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
         WritableArray response = new WritableNativeArray();
         try {
           if (media.moveToFirst()) {
-            Map<String, Integer> albums = new HashMap<>();
+            Map<String, Map<String, Object>> albums = new HashMap<>();
             do {
               int column = media.getColumnIndex(MediaStore.Images.ImageColumns.BUCKET_DISPLAY_NAME);
+              int albumIdIndex = media.getColumnIndex(Images.ImageColumns.BUCKET_ID);
               if (column < 0) {
                 throw new IndexOutOfBoundsException();
               }
+              String albumId = media.getString(albumIdIndex);
               String albumName = media.getString(column);
               if (albumName != null) {
-                Integer albumCount = albums.get(albumName);
-                if (albumCount == null) {
-                  albums.put(albumName, 1);
+                Map<String, Object> albumData = albums.get(albumName);
+                if (albumData == null) {
+                  albums.put(albumName, new HashMap<String, Object>() {{
+                    put("id", albumId);
+                    put("count", 1);
+                  }});
                 } else {
-                  albums.put(albumName, albumCount + 1);
+                  Integer albumCount = (Integer) albumData.get("count");
+                  albumData.put("count", albumCount + 1);
                 }
               }
             } while (media.moveToNext());
 
-            for (Map.Entry<String, Integer> albumEntry : albums.entrySet()) {
+            for (Map.Entry<String, Map<String, Object>> albumEntry : albums.entrySet()) {
               WritableMap album = new WritableNativeMap();
+              Map<String, Object> albumData = albumEntry.getValue();
               album.putString("title", albumEntry.getKey());
-              album.putInt("count", albumEntry.getValue());
+              album.putInt("count", (Integer) albumData.get("count"));
+              album.putString("id", (String) albumData.get("id"));
               response.pushMap(album);
             }
           }
@@ -557,14 +603,11 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
     response.putMap("page_info", pageInfo);
   }
 
-  private static void putEdges(
+  private static @Nullable WritableMap convertMediaToMap(
           ContentResolver resolver,
           Cursor media,
-          WritableMap response,
-          int limit,
           Set<String> include) {
-    WritableArray edges = new WritableNativeArray();
-    media.moveToFirst();
+    int idIndex = media.getColumnIndex(Images.Media._ID);
     int mimeTypeIndex = media.getColumnIndex(Images.Media.MIME_TYPE);
     int groupNameIndex = media.getColumnIndex(Images.Media.BUCKET_DISPLAY_NAME);
     int dateTakenIndex = media.getColumnIndex(Images.Media.DATE_TAKEN);
@@ -583,20 +626,39 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
     boolean includeImageSize = include.contains(INCLUDE_IMAGE_SIZE);
     boolean includePlayableDuration = include.contains(INCLUDE_PLAYABLE_DURATION);
     boolean includeOrientation = include.contains(INCLUDE_ORIENTATION);
+    boolean includeAlbums = include.contains(INCLUDE_ALBUMS);
+    boolean includeSourceType = include.contains(INCLUDE_SOURCE_TYPE);
+
+    WritableMap map = new WritableNativeMap();
+    WritableMap node = new WritableNativeMap();
+    boolean imageInfoSuccess =
+            putImageInfo(resolver, media, node, widthIndex, heightIndex, sizeIndex, dataIndex, orientationIndex,
+                    mimeTypeIndex, includeFilename, includeFileSize, includeFileExtension, includeImageSize,
+                    includePlayableDuration, includeOrientation);
+    if (imageInfoSuccess) {
+      putBasicNodeInfo(media, node, idIndex, mimeTypeIndex, groupNameIndex, dateTakenIndex, dateAddedIndex, dateModifiedIndex, includeAlbums, includeSourceType);
+      putLocationInfo(media, node, dataIndex, includeLocation, mimeTypeIndex, resolver);
+
+      map.putMap("node", node);
+      return map;
+    } else {
+      return null;
+    }
+  }
+
+  private static void putEdges(
+          ContentResolver resolver,
+          Cursor media,
+          WritableMap response,
+          int limit,
+          Set<String> include) {
+    WritableArray edges = new WritableNativeArray();
+    media.moveToFirst();
 
     for (int i = 0; i < limit && !media.isAfterLast(); i++) {
-      WritableMap edge = new WritableNativeMap();
-      WritableMap node = new WritableNativeMap();
-      boolean imageInfoSuccess =
-              putImageInfo(resolver, media, node, widthIndex, heightIndex, sizeIndex, dataIndex, orientationIndex,
-                      mimeTypeIndex, includeFilename, includeFileSize, includeFileExtension, includeImageSize,
-                      includePlayableDuration, includeOrientation);
-      if (imageInfoSuccess) {
-        putBasicNodeInfo(media, node, mimeTypeIndex, groupNameIndex, dateTakenIndex, dateAddedIndex, dateModifiedIndex);
-        putLocationInfo(media, node, dataIndex, includeLocation, mimeTypeIndex, resolver);
-
-        edge.putMap("node", node);
-        edges.pushMap(edge);
+      WritableMap map = convertMediaToMap(resolver, media, include);
+      if (map != null) {
+        edges.pushMap(map);
       } else {
         // we skipped an image because we couldn't get its details (e.g. width/height), so we
         // decrement i in order to correctly reach the limit, if the cursor has enough rows
@@ -610,15 +672,32 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
   private static void putBasicNodeInfo(
           Cursor media,
           WritableMap node,
+          int idIndex,
           int mimeTypeIndex,
           int groupNameIndex,
           int dateTakenIndex,
           int dateAddedIndex,
-          int dateModifiedIndex) {
+          int dateModifiedIndex,
+          boolean includeAlbums,
+          boolean includeSourceType) {
+    node.putString("id", Long.toString(media.getLong(idIndex)));
     node.putString("type", media.getString(mimeTypeIndex));
+
     WritableArray subTypes = Arguments.createArray();
     node.putArray("subTypes", subTypes);
-    node.putString("group_name", media.getString(groupNameIndex));
+    
+    if (includeSourceType) {
+      node.putString("sourceType", "UserLibrary");
+    } else {
+      node.putNull("sourceType");
+    }
+
+    WritableArray group_name = Arguments.createArray();
+  
+    if (includeAlbums) {
+      group_name.pushString(media.getString(groupNameIndex));
+    }
+    node.putArray("group_name", group_name);
     long dateTaken = media.getLong(dateTakenIndex);
     if (dateTaken == 0L) {
       //date added is in seconds, date taken in milliseconds, thus the multiplication
@@ -649,7 +728,11 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
           boolean includePlayableDuration,
           boolean includeOrientation) {
     WritableMap image = new WritableNativeMap();
-    Uri photoUri = Uri.parse("file://" + media.getString(dataIndex));
+    int index = media.getColumnIndex(Images.Media._ID);
+    long id = (index >= 0) ? media.getLong(index) : -1;
+    // Updating this to return content uri to fix issue with playing videos saved to SD cards as
+    // this ensures item that is picked is read-only, and masks it's real source
+    Uri photoUri = ContentUris.withAppendedId(MediaStore.Files.getContentUri("external"), id);
     image.putString("uri", photoUri.toString());
     String mimeType = media.getString(mimeTypeIndex);
 
@@ -1008,4 +1091,12 @@ public class CameraRollModule extends NativeCameraRollModuleSpec {
       }
     }
   }
+
+  @ReactMethod
+  public void getPhotoThumbnail(String internalID, ReadableMap options, Promise promise) {
+    promise.reject("CameraRoll:getPhotoThumbnail", "getPhotoThumbnail is not supported on Android");
+  }
+
+  public void addListener(String eventName) {}
+  public void removeListeners(double count) {}
 }

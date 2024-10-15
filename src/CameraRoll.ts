@@ -4,7 +4,7 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
-import {Platform} from 'react-native';
+import {NativeEventEmitter, Platform} from 'react-native';
 import RNCCameraRoll from './NativeCameraRollModule';
 
 const GROUP_TYPES_OPTIONS = {
@@ -13,6 +13,7 @@ const GROUP_TYPES_OPTIONS = {
   Event: 'Event',
   Faces: 'Faces',
   Library: 'Library',
+  SmartAlbum: 'SmartAlbum',
   PhotoStream: 'PhotoStream',
   SavedPhotos: 'SavedPhotos',
 };
@@ -23,12 +24,19 @@ const ASSET_TYPE_OPTIONS = {
   Photos: 'Photos',
 };
 
+const ALBUM_TYPE_OPTIONS = {
+  All: 'All',
+  Album: 'Album',
+  SmartAlbum: 'SmartAlbum',
+};
+
 export type GroupTypes =
   | 'Album'
   | 'All'
   | 'Event'
   | 'Faces'
   | 'Library'
+  | 'SmartAlbum'
   | 'PhotoStream'
   | 'SavedPhotos';
 
@@ -42,6 +50,8 @@ export type SubTypes =
   | 'VideoHighFrameRate'
   | 'VideoTimelapse';
 
+export type SourceType = 'UserLibrary' | 'CloudShared';
+
 export type Include =
   | 'filename'
   | 'fileSize'
@@ -49,9 +59,13 @@ export type Include =
   | 'location'
   | 'imageSize'
   | 'playableDuration'
-  | 'orientation';
+  | 'orientation'
+  | 'albums'
+  | 'sourceType';
 
 export type AssetType = 'All' | 'Videos' | 'Photos';
+
+export type AlbumType = 'All' | 'Album' | 'SmartAlbum';
 
 /**
  * Shape of the param arg for the `getPhotos` function.
@@ -114,9 +128,11 @@ export type GetPhotosParams = {
 
 export type PhotoIdentifier = {
   node: {
+    id: string;
     type: string;
     subTypes: SubTypes;
-    group_name: string;
+    sourceType: SourceType;
+    group_name: string[];
     image: {
       filename: string | null;
       filepath: string | null;
@@ -142,7 +158,7 @@ export type PhotoIdentifier = {
 
 export type PhotoConvertionOptions = {
   convertHeicImages?: boolean;
-  quality?: number
+  quality?: number;
 };
 
 export type PhotoIdentifiersPage = {
@@ -162,6 +178,7 @@ export type SaveToCameraRollOptions = {
 
 export type GetAlbumsParams = {
   assetType?: AssetType;
+  albumType?: AlbumType;
 };
 
 export type AlbumSubType =
@@ -175,25 +192,33 @@ export type AlbumSubType =
   | 'Unknown';
 
 export type Album = {
+  id: string;
   title: string;
   count: number;
+  type: AlbumType;
   subtype?: AlbumSubType;
 };
 
 export type ThumbnailSize = {
-  height: number,
-  width: number
+  height: number;
+  width: number;
 };
 
 export type PhotoThumbnailOptions = {
-  allowNetworkAccess: boolean,  //iOS only
-  targetSize: ThumbnailSize,
-  quality: number
+  allowNetworkAccess: boolean; //iOS only
+  targetSize: ThumbnailSize;
+  quality: number;
 };
 
 export type PhotoThumbnail = {
-  thumbnailBase64: string,
+  thumbnailBase64: string;
 };
+
+const isIOS = Platform.OS === 'ios';
+
+export const progressUpdateEventEmitter = new NativeEventEmitter(
+  isIOS ? RNCCameraRoll : undefined,
+);
 
 /**
  * `CameraRoll` provides access to the local camera roll or photo library.
@@ -203,6 +228,7 @@ export type PhotoThumbnail = {
 export class CameraRoll {
   static GroupTypesOptions = GROUP_TYPES_OPTIONS;
   static AssetTypeOptions = ASSET_TYPE_OPTIONS;
+  static AlbumTypeOptions = ALBUM_TYPE_OPTIONS;
 
   /**
    * On iOS: requests deletion of a set of photos from the camera roll.
@@ -214,13 +240,29 @@ export class CameraRoll {
   }
 
   /**
-   * Saves the photo or video to the camera roll or photo library.
+   * Saves the photo or video to the camera roll or photo library, and returns the URI of the newly created asset.
    *
+   * @deprecated `save(...)` is deprecated - use `saveAsset(...)` instead.
    */
-  static save(
+  static async save(
     tag: string,
     options: SaveToCameraRollOptions = {},
   ): Promise<string> {
+    const asset = await this.saveAsset(tag, options);
+    return asset.node.image.uri;
+  }
+
+  /**
+   * Saves the photo or video to the camera roll or photo library, and returns the newly created asset.
+   *
+   * @param tag The URI of the file you want to save to the camera roll.
+   * @param options Custom options for saving to a specific album, or overriding the media type.
+   * @returns The newly created `PhotoIdentifier` from the camera roll.
+   */
+  static saveAsset(
+    tag: string,
+    options: SaveToCameraRollOptions = {},
+  ): Promise<PhotoIdentifier> {
     let {type = 'auto'} = options;
     const {album = ''} = options;
     if (tag === '') throw new Error('tag must be a valid string');
@@ -237,15 +279,15 @@ export class CameraRoll {
   static saveToCameraRoll(
     tag: string,
     type?: 'photo' | 'video' | 'auto',
-  ): Promise<string> {
+  ): Promise<PhotoIdentifier> {
     console.warn(
       'CameraRoll.saveToCameraRoll(tag, type) is deprecated.  Use the save function instead',
     );
-    return CameraRoll.save(tag, {type});
+    return CameraRoll.saveAsset(tag, {type});
   }
 
   static getAlbums(
-    params: GetAlbumsParams = {assetType: 'All'},
+    params: GetAlbumsParams = {assetType: 'All', albumType: 'Album'},
   ): Promise<Album[]> {
     return RNCCameraRoll.getAlbums(params);
   }
@@ -285,19 +327,22 @@ export class CameraRoll {
   ): Promise<PhotoIdentifier> {
     const conversionOptions = {
       convertHeicImages: false,
-      ...options
-    }
+      ...options,
+    };
     return RNCCameraRoll.getPhotoByInternalID(internalID, conversionOptions);
   }
 
-    /**
+  /**
    * Returns a Promise with thumbnail photo.
    *
    * @param internalID - PH photo internal ID.
    * @param options - thumbnail photo options.
    * @returns Promise<PhotoThumbnail>
    */
-    static getPhotoThumbnail(internalID: string, options: PhotoThumbnailOptions): Promise<PhotoThumbnail> {
-      return RNCCameraRoll.getPhotoThumbnail(internalID, options);
-    }
+  static getPhotoThumbnail(
+    internalID: string,
+    options: PhotoThumbnailOptions,
+  ): Promise<PhotoThumbnail> {
+    return RNCCameraRoll.getPhotoThumbnail(internalID, options);
+  }
 }
